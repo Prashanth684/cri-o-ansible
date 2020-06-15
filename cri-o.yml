@@ -110,7 +110,12 @@
       git:
         repo: https://github.com/kubernetes-incubator/cri-o
         dest: /root/src/github.com/kubernetes-incubator/cri-o
-        version: kube-1.6.x
+        version: release-1.18
+
+    - name: clone conmon
+      git:
+        repo: https://github.com/containers/conmon
+        dest: /root/src/github.com/containers/conmon
 
     - name: clone CNI
       git:
@@ -127,13 +132,18 @@
     - name: link runc
       file: src=/usr/local/sbin/runc dest=/usr/bin/runc state=link force=yes
 
+    - name: build conmon
+      shell: |
+            cd /root/src/github.com/containers/conmon && \
+            make && \
+            make install
+
     - name: build cri-o
       shell: |
               cd /root/src/github.com/kubernetes-incubator/cri-o && \
-              make install.tools && \
               make && \
               make install && \
-              make install.systemd && \
+              make install.systemd &&
               make install.config
 
     - name: install policy.json in Ubuntu
@@ -145,17 +155,23 @@
     - name: build CNI stuff
       shell: |
               cd /root/src/github.com/containernetworking/plugins && \
-              ./build.sh && \
+              ./build_linux.sh && \
               mkdir -p /opt/cni/bin && \
               cp bin/* /opt/cni/bin/
 
-    - name: run CRI-O with systemd cgroup manager
+    - name: run CRI-O with cgroupfs cgroup manager
       replace:
-        regexp: 'cgroupfs'
-        replace: 'systemd'
+        regexp: 'systemd'
+        replace: 'cgroupfs'
         name: /etc/crio/crio.conf
         backup: yes
       when: ansible_distribution in ['Fedora', 'RedHat', 'CentOS']
+
+    - name: Temporary workaround to create hooks directory
+      file:
+        path: /usr/share/containers/oci/hooks.d
+        state: directory
+        mode: '0755'
 
     - name: run with overlay2
       replace:
@@ -214,6 +230,17 @@
       command: "sysctl -p"
       ignore_errors: true
 
+    - name: copy registries.conf file with docker and quay
+      copy:
+        src: ./files/registries.conf
+        dest: /etc/containers/registries.conf
+
+    - name: restart CRI-O
+      systemd:
+        name: crio
+        state: restarted
+        daemon_reload: yes
+
     - name: systemd dropin for kubeadm
       shell: |
               sh -c 'echo "[Service]
@@ -232,3 +259,30 @@
     - name: disable selinux
       command: "setenforce 0"
       when: ansible_distribution in ['Fedora', 'RedHat', 'CentOS']
+
+    - name: disable firewalld
+      command: "systemctl stop firewalld"
+      when: ansible_distribution in ['Fedora', 'RedHat', 'CentOS']
+
+    - name: disable swap
+      command: "swapoff -a"
+      when: ansible_distribution in ['Fedora', 'RedHat', 'CentOS']
+
+    # enable ip-forwarding
+    - sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    # Systemd drop in for NM to ignore calico interfaces
+    - name: systemd dropin for calico
+      shell: |
+              sh -c 'echo "[keyfile]
+              unmanaged-devices=interface-name:cali*;interface-name:tunl*" > /etc/NetworkManager/conf.d/calico.conf'
+
+    - name: Restart NM
+      service:
+        name: NetworkManager
+        state: restarted
